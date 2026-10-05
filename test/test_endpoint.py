@@ -2,7 +2,12 @@
 # pylint: disable=redefined-outer-name
 from concurrent import futures
 import time
-import mock
+
+try:
+    import mock
+except ImportError:  # Python 3.3+
+    from unittest import mock
+
 import pytest
 
 from pyls_jsonrpc import exceptions
