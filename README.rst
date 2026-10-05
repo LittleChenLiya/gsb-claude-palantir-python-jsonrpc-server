@@ -33,6 +33,23 @@ Then running `python examples/langserver.py` or `python examples/langserver_ext.
 
 To setup a client, you can use the examples from `Monaco Language Client`_.
 
+Framing
+-------
+
+Messages are framed like the Language Server Protocol: a ``Content-Length``
+header (counting the body's UTF-8 bytes), an optional ``Content-Type``
+header, a blank line (``\r\n\r\n``), then the JSON body. ``JsonRpcStreamReader``
+reads frames with explicit bounds and tolerates arbitrary byte chunking of the
+underlying stream. Protocol errors raise distinct ``ValueError`` subclasses
+(``JsonRpcInvalidContentLength``, ``JsonRpcDuplicateContentLength``,
+``JsonRpcHeaderTooLarge``, ``JsonRpcContentLengthTooLarge``,
+``JsonRpcTruncatedMessage``); truncated bodies are never delivered. The header
+and body limits default to 64 KiB and 16 MiB and can be configured::
+
+    reader = JsonRpcStreamReader(rfile, max_header_size=2**16, max_content_length=2**24)
+
+See ``examples/protocol_framing.py`` for a runnable example.
+
 Development
 -----------
 
