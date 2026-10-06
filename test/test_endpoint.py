@@ -318,6 +318,66 @@ def test_consume_request_cancel_unknown(endpoint):
     })
 
 
+def test_consume_batch_mixed(endpoint, consumer, dispatcher):
+    # Two valid request handlers
+    first_handler = mock.Mock(return_value='first')
+    second_handler = mock.Mock(return_value='second')
+    notify_handler = mock.Mock()
+    dispatcher['firstMethod'] = first_handler
+    dispatcher['secondMethod'] = second_handler
+    dispatcher['notifyMethod'] = notify_handler
+
+    # A request, a notification, an invalid item, another request and a
+    # malformed (non-dict) item, in a single batch
+    endpoint.consume_batch([
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'firstMethod', 'params': {'k': 1}},
+        {'jsonrpc': '2.0', 'method': 'notifyMethod', 'params': {'k': 2}},
+        {'not': 'a valid message'},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'secondMethod'},
+        'not even a dict',
+    ])
+
+    # Each valid handler is called exactly once, in input order
+    first_handler.assert_called_once_with({'k': 1})
+    notify_handler.assert_called_once_with({'k': 2})
+    second_handler.assert_called_once_with(None)
+
+    # Exactly the two request responses, in the position of their requests
+    consumer.assert_called_once_with([
+        {'jsonrpc': '2.0', 'id': 1, 'result': 'first'},
+        {'jsonrpc': '2.0', 'id': 2, 'result': 'second'},
+    ])
+
+
+def test_consume_batch_all_notifications(endpoint, consumer, dispatcher):
+    handler = mock.Mock()
+    dispatcher['notifyMethod'] = handler
+
+    endpoint.consume_batch([
+        {'jsonrpc': '2.0', 'method': 'notifyMethod', 'params': {'k': 1}},
+        {'jsonrpc': '2.0', 'method': 'notifyMethod', 'params': {'k': 2}},
+    ])
+
+    assert handler.call_count == 2
+    # All-notification batches produce no output, not even an empty array
+    consumer.assert_not_called()
+
+
+def test_consume_batch_only_invalid(endpoint, consumer):
+    # Invalid items do not cancel each other, and produce no responses
+    endpoint.consume_batch([
+        {'not': 'a valid message'},
+        'not even a dict',
+    ])
+    consumer.assert_not_called()
+
+
+def test_consume_batch_not_a_list(endpoint, consumer):
+    # Verify consume doesn't throw for a non-list batch
+    endpoint.consume_batch({'jsonrpc': '2.0', 'id': 1, 'method': 'methodName'})
+    consumer.assert_not_called()
+
+
 def assert_consumer_error(consumer_mock, exception):
     """Assert that the consumer mock has had once call with the given error message and code.
 

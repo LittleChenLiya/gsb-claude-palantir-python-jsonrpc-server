@@ -97,6 +97,41 @@ class Endpoint(object):
         Args:
             message (dict): The JSON RPC message sent by the client
         """
+        self._consume(message, self._consumer)
+
+    def consume_batch(self, messages):
+        """Consume a JSON RPC batch (a list of messages) from the client.
+
+        Messages are handled sequentially, in the order they were received.
+        Responses to requests are collected in the same positions as the
+        requests and delivered to the client as a single array. Notifications
+        never produce responses and invalid items are skipped on their own, so
+        one bad item cannot cancel the other (valid) items. If the batch does
+        not contain any request that produced a response, nothing is sent to
+        the client, not even an empty array.
+
+        Args:
+            messages (list): The list of JSON RPC messages sent by the client
+        """
+        if not isinstance(messages, list):
+            log.warning("Invalid batch message %s", messages)
+            return
+
+        responses = []
+        for message in messages:
+            if not isinstance(message, dict):
+                log.warning("Ignoring invalid batch item %s", message)
+                continue
+            try:
+                self._consume(message, responses.append)
+            except Exception:  # pylint: disable=broad-except
+                log.exception("Failed to handle batch item %s", message)
+
+        if responses:
+            self._consumer(responses)
+
+    def _consume(self, message, consumer):
+        """Consume a single JSON RPC message, sending any response to consumer."""
         if 'jsonrpc' not in message or message['jsonrpc'] != JSONRPC_VERSION:
             log.warning("Unknown message type %s", message)
             return
@@ -110,17 +145,17 @@ class Endpoint(object):
         else:
             try:
                 log.debug("Handling request from client %s", message)
-                self._handle_request(message['id'], message['method'], message.get('params'))
+                self._handle_request(message['id'], message['method'], message.get('params'), consumer)
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", message['id'])
-                self._consumer({
+                consumer({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
                     'error': e.to_dict()
                 })
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", message['id'])
-                self._consumer({
+                consumer({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
                     'error': JsonRpcInternalError.of(sys.exc_info()).to_dict()
@@ -172,8 +207,11 @@ class Endpoint(object):
         if request_future.cancel():
             log.debug("Cancelled request with id %s", msg_id)
 
-    def _handle_request(self, msg_id, method, params):
+    def _handle_request(self, msg_id, method, params, consumer=None):
         """Handle a request from the client."""
+        if consumer is None:
+            consumer = self._consumer
+
         try:
             handler = self._dispatcher[method]
         except KeyError:
@@ -185,21 +223,24 @@ class Endpoint(object):
             log.debug("Executing async request handler %s", handler_result)
             request_future = self._executor_service.submit(handler_result)
             self._client_request_futures[msg_id] = request_future
-            request_future.add_done_callback(self._request_callback(msg_id))
+            request_future.add_done_callback(self._request_callback(msg_id, consumer))
         elif isinstance(handler_result, futures.Future):
             log.debug("Request handler is already a future %s", handler_result)
             self._client_request_futures[msg_id] = handler_result
-            handler_result.add_done_callback(self._request_callback(msg_id))
+            handler_result.add_done_callback(self._request_callback(msg_id, consumer))
         else:
             log.debug("Got result from synchronous request handler: %s", handler_result)
-            self._consumer({
+            consumer({
                 'jsonrpc': JSONRPC_VERSION,
                 'id': msg_id,
                 'result': handler_result
             })
 
-    def _request_callback(self, request_id):
+    def _request_callback(self, request_id, consumer=None):
         """Construct a request callback for the given request ID."""
+        if consumer is None:
+            consumer = self._consumer
+
         def callback(future):
             # Remove the future from the client requests map
             self._client_request_futures.pop(request_id, None)
@@ -221,7 +262,7 @@ class Endpoint(object):
                 log.exception("Failed to handle request %s", request_id)
                 message['error'] = JsonRpcInternalError.of(sys.exc_info()).to_dict()
 
-            self._consumer(message)
+            consumer(message)
 
         return callback
 
