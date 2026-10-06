@@ -318,6 +318,115 @@ def test_consume_request_cancel_unknown(endpoint):
     })
 
 
+def test_consume_batch_mixed(dispatcher):
+    # Two valid requests, one notification and one invalid item, interleaved.
+    handler_a = mock.Mock(return_value='result-a')
+    handler_b = mock.Mock(return_value='result-b')
+    notify_handler = mock.Mock()
+    dispatcher['requestA'] = handler_a
+    dispatcher['requestB'] = handler_b
+    dispatcher['notifyMethod'] = notify_handler
+    consumer = mock.MagicMock()
+    ep = Endpoint(dispatcher, consumer)
+
+    ep.consume_batch([
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'requestA', 'params': {'key': 'a'}},
+        {'jsonrpc': '2.0', 'method': 'notifyMethod', 'params': {'key': 'n'}},
+        'not a valid request',
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'requestB'},
+    ])
+
+    # The invalid item must not cancel the valid requests: each handler runs once.
+    handler_a.assert_called_once_with({'key': 'a'})
+    handler_b.assert_called_once_with(None)
+    notify_handler.assert_called_once_with({'key': 'n'})
+
+    # Notifications and invalid items produce no response; order follows input positions.
+    consumer.assert_called_once_with([
+        {'jsonrpc': '2.0', 'id': 1, 'result': 'result-a'},
+        {'jsonrpc': '2.0', 'id': 2, 'result': 'result-b'},
+    ])
+
+
+def test_consume_batch_invalid_item_keeps_other_requests(dispatcher):
+    # A method-not-found request is still an invalid-ish item for a batch: its failure
+    # must not prevent the later valid request from being processed and answered.
+    handler_b = mock.Mock(return_value='result-b')
+    dispatcher['requestB'] = handler_b
+    consumer = mock.MagicMock()
+    ep = Endpoint(dispatcher, consumer)
+
+    ep.consume_batch([
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'missingMethod'},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'requestB'},
+    ])
+
+    handler_b.assert_called_once_with(None)
+    consumer.assert_called_once_with([
+        {
+            'jsonrpc': '2.0',
+            'id': 1,
+            'error': exceptions.JsonRpcMethodNotFound.of('missingMethod').to_dict(),
+        },
+        {'jsonrpc': '2.0', 'id': 2, 'result': 'result-b'},
+    ])
+
+
+def test_consume_batch_all_notifications(dispatcher):
+    notify_a = mock.Mock()
+    notify_b = mock.Mock()
+    dispatcher['notifyA'] = notify_a
+    dispatcher['notifyB'] = notify_b
+    consumer = mock.MagicMock()
+    ep = Endpoint(dispatcher, consumer)
+
+    ep.consume_batch([
+        {'jsonrpc': '2.0', 'method': 'notifyA', 'params': {'key': 'a'}},
+        {'jsonrpc': '2.0', 'method': 'notifyB'},
+    ])
+
+    notify_a.assert_called_once_with({'key': 'a'})
+    notify_b.assert_called_once_with(None)
+    # All notifications (plus an invalid item mixed in) must produce no output at all.
+    ep.consume_batch([
+        {'jsonrpc': '2.0', 'method': 'notifyA'},
+        {'jsonrpc': '1.0', 'method': 'wrongVersion'},
+        42,
+    ])
+    assert consumer.call_count == 0
+
+
+def test_consume_batch_empty(dispatcher):
+    consumer = mock.MagicMock()
+    ep = Endpoint(dispatcher, consumer)
+
+    ep.consume_batch([])
+
+    consumer.assert_called_once_with({
+        'jsonrpc': '2.0',
+        'id': None,
+        'error': exceptions.JsonRpcInvalidRequest().to_dict(),
+    })
+
+
+def test_consume_routes_list_to_batch(dispatcher):
+    # The original single-message entry is retained, but a list is handled as a batch.
+    handler = mock.Mock(return_value=1234)
+    dispatcher['methodName'] = handler
+    consumer = mock.MagicMock()
+    ep = Endpoint(dispatcher, consumer)
+
+    ep.consume([
+        {'jsonrpc': '2.0', 'id': MSG_ID, 'method': 'methodName'},
+        {'jsonrpc': '2.0', 'method': 'someNotification'},
+    ])
+
+    handler.assert_called_once_with(None)
+    consumer.assert_called_once_with([
+        {'jsonrpc': '2.0', 'id': MSG_ID, 'result': 1234},
+    ])
+
+
 def assert_consumer_error(consumer_mock, exception):
     """Assert that the consumer mock has had once call with the given error message and code.
 

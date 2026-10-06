@@ -4,7 +4,10 @@ import uuid
 import sys
 
 from concurrent import futures
-from .exceptions import JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError, JsonRpcMethodNotFound
+from .exceptions import (
+    JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError,
+    JsonRpcInvalidRequest, JsonRpcMethodNotFound
+)
 
 log = logging.getLogger(__name__)
 JSONRPC_VERSION = '2.0'
@@ -95,8 +98,13 @@ class Endpoint(object):
         """Consume a JSON RPC message from the client.
 
         Args:
-            message (dict): The JSON RPC message sent by the client
+            message (dict | list): The JSON RPC message sent by the client. A list of messages
+                is treated as a JSON RPC batch and forwarded to :meth:`consume_batch`.
         """
+        if isinstance(message, list):
+            self.consume_batch(message)
+            return
+
         if 'jsonrpc' not in message or message['jsonrpc'] != JSONRPC_VERSION:
             log.warning("Unknown message type %s", message)
             return
@@ -125,6 +133,101 @@ class Endpoint(object):
                     'id': message['id'],
                     'error': JsonRpcInternalError.of(sys.exc_info()).to_dict()
                 })
+
+    def consume_batch(self, messages):
+        """Consume a JSON RPC batch (a list of messages) from the client.
+
+        Messages are processed sequentially in their input order. A single invalid
+        item never cancels the processing of the other valid requests; invalid items
+        are ignored and produce no response. Notifications are dispatched but never
+        produce a response. Responses are collected in input position order and sent
+        to the consumer as a single list. When every item is a notification (or is
+        invalid) nothing is sent to the consumer, so no empty array is ever written.
+
+        Args:
+            messages (list): A list of JSON RPC messages.
+        """
+        if not messages:
+            # Per the JSON RPC spec an empty batch is a single invalid request.
+            self._consumer({
+                'jsonrpc': JSONRPC_VERSION,
+                'id': None,
+                'error': JsonRpcInvalidRequest().to_dict()
+            })
+            return
+
+        responses = []
+        for message in messages:
+            response = self._handle_batch_item(message)
+            if response is not None:
+                responses.append(response)
+
+        # Do not write an empty array when the batch only contained notifications.
+        if responses:
+            self._consumer(responses)
+
+    def _handle_batch_item(self, message):
+        """Handle a single item of a batch.
+
+        Returns the response dict for a request, or ``None`` when the item is a
+        notification or invalid (and therefore produces no response).
+        """
+        if not self._is_valid_request(message):
+            log.warning("Ignoring invalid batch item %s", message)
+            return None
+
+        if 'id' not in message:
+            log.debug("Handling batch notification from client %s", message)
+            self._handle_notification(message['method'], message.get('params'))
+            return None
+
+        log.debug("Handling batch request from client %s", message)
+        response = {'jsonrpc': JSONRPC_VERSION, 'id': message['id']}
+        try:
+            response['result'] = self._handle_batch_request(
+                message['method'], message.get('params')
+            )
+        except JsonRpcException as e:
+            log.exception("Failed to handle batch request %s", message['id'])
+            response['error'] = e.to_dict()
+        except Exception:  # pylint: disable=broad-except
+            log.exception("Failed to handle batch request %s", message['id'])
+            response['error'] = JsonRpcInternalError.of(sys.exc_info()).to_dict()
+        return response
+
+    @staticmethod
+    def _is_valid_request(message):
+        """Return whether a batch item is a well-formed JSON RPC request/notification."""
+        if not isinstance(message, dict):
+            return False
+        if message.get('jsonrpc') != JSONRPC_VERSION:
+            return False
+        method = message.get('method')
+        return isinstance(method, str) and bool(method)
+
+    def _handle_batch_request(self, method, params):
+        """Synchronously dispatch a batch request and return its result.
+
+        Handlers returning a plain value complete immediately. Callable/Future
+        results are resolved within the existing executor (no new scheduling layer),
+        one at a time, to keep batch processing sequential and responses ordered.
+        """
+        try:
+            handler = self._dispatcher[method]
+        except KeyError:
+            raise JsonRpcMethodNotFound.of(method)
+
+        handler_result = handler(params)
+
+        if callable(handler_result):
+            log.debug("Executing async batch request handler %s", handler_result)
+            return self._executor_service.submit(handler_result).result()
+        if isinstance(handler_result, futures.Future):
+            log.debug("Waiting on batch request handler future %s", handler_result)
+            return handler_result.result()
+
+        log.debug("Got result from synchronous batch request handler: %s", handler_result)
+        return handler_result
 
     def _handle_notification(self, method, params):
         """Handle a notification from the client."""
