@@ -318,6 +318,108 @@ def test_consume_request_cancel_unknown(endpoint):
     })
 
 
+def test_close_fails_pending_requests(consumer):
+    # Two manually driven pending requests, no thread pool involved
+    id_sequence = iter(['id-1', 'id-2'])
+    endpoint = Endpoint({}, consumer, id_generator=lambda: next(id_sequence))
+
+    first_future = endpoint.request('firstMethod')
+    second_future = endpoint.request('secondMethod')
+    assert not first_future.done()
+    assert not second_future.done()
+
+    endpoint.close()
+
+    # Both pending requests end with the same shutdown exception
+    for pending_future in (first_future, second_future):
+        with pytest.raises(exceptions.JsonRpcServerStopped):
+            pending_future.result(timeout=2)
+        assert pending_future.exception() == exceptions.JsonRpcServerStopped()
+
+    # Closing writes nothing itself; only the two request messages reached the consumer
+    assert consumer.call_count == 2
+
+
+def test_late_response_after_close_does_not_recomplete_future(consumer):
+    endpoint = Endpoint({}, consumer, id_generator=lambda: MSG_ID)
+    pending_future = endpoint.request('methodName')
+
+    endpoint.close()
+    with pytest.raises(exceptions.JsonRpcServerStopped):
+        pending_future.result(timeout=2)
+
+    # A late successful or erroneous response is ignored and never re-completes the future
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'result': 1234
+    })
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'error': exceptions.JsonRpcInvalidRequest().to_dict()
+    })
+
+    assert pending_future.exception() == exceptions.JsonRpcServerStopped()
+    assert consumer.call_count == 1
+
+
+def test_request_and_notify_after_close_are_blocked(consumer):
+    endpoint = Endpoint({}, consumer, id_generator=lambda: MSG_ID)
+    endpoint.close()
+
+    # Sending after close fails locally without ever writing to the consumer
+    pending_future = endpoint.request('methodName', {'key': 'value'})
+    endpoint.notify('notificationName', {'key': 'value'})
+
+    with pytest.raises(exceptions.JsonRpcServerStopped):
+        pending_future.result(timeout=2)
+    consumer.assert_not_called()
+
+
+def test_close_is_idempotent_and_keeps_external_executor(consumer):
+    external_executor = mock.MagicMock()
+    endpoint = Endpoint({}, consumer, id_generator=lambda: MSG_ID, executor=external_executor)
+    pending_future = endpoint.request('methodName')
+
+    # Repeated close must be a no-op and must not raise
+    endpoint.close()
+    endpoint.close()
+
+    with pytest.raises(exceptions.JsonRpcServerStopped):
+        pending_future.result(timeout=2)
+
+    # Neither close nor shutdown cancels the externally provided executor
+    endpoint.shutdown()
+    external_executor.shutdown.assert_not_called()
+
+
+def test_close_does_not_cancel_manual_handler_future(consumer, dispatcher):
+    # A manually driven future returned by a handler, no thread pool involved
+    handler_future = futures.Future()
+    handler = mock.Mock(return_value=handler_future)
+    dispatcher['methodName'] = handler
+    endpoint = Endpoint(dispatcher, consumer, id_generator=lambda: MSG_ID)
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+    handler.assert_called_once_with({'key': 'value'})
+
+    endpoint.close()
+
+    # The external future is detached without being cancelled
+    assert not handler_future.cancelled()
+    assert not handler_future.done()
+
+    # Completing it after the close must not write to the closed consumer
+    handler_future.set_result(1234)
+    consumer.assert_not_called()
+
+
 def assert_consumer_error(consumer_mock, exception):
     """Assert that the consumer mock has had once call with the given error message and code.
 

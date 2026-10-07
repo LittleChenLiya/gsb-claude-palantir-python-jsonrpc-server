@@ -84,6 +84,12 @@ class JsonRpcRequestCancelled(JsonRpcException):
     MESSAGE = 'Request Cancelled'
 
 
+class JsonRpcServerStopped(JsonRpcException):
+    # Reserved range for implementation-defined server-errors (-32099 to -32000)
+    CODE = -32000
+    MESSAGE = 'JSON RPC server is stopped'
+
+
 class JsonRpcServerError(JsonRpcException):
 
     def __init__(self, message, code, data=None):
@@ -106,5 +112,6 @@ _EXCEPTIONS = (
     JsonRpcInvalidParams,
     JsonRpcInternalError,
     JsonRpcRequestCancelled,
+    JsonRpcServerStopped,
     JsonRpcServerError,
 )
