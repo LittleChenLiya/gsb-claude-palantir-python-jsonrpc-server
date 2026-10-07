@@ -6,9 +6,30 @@ import sys
 from concurrent import futures
 from .exceptions import JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError, JsonRpcMethodNotFound
 
+try:
+    import ujson as json
+except Exception:  # pylint: disable=broad-except
+    import json
+
 log = logging.getLogger(__name__)
 JSONRPC_VERSION = '2.0'
 CANCEL_METHOD = '$/cancelRequest'
+
+
+def _error_response_dict(exception):
+    """Serialize an exception to a JSON RPC error dict.
+
+    Only JSON serializable payloads are accepted: if the error (e.g. its structured
+    ``data`` member) cannot be JSON serialized, fall back to the existing internal
+    error format so that sending the response can never fail.
+    """
+    error = exception.to_dict()
+    try:
+        json.dumps(error)
+    except (TypeError, ValueError, OverflowError):
+        log.warning("Error is not JSON serializable, falling back to internal error format: %s", exception)
+        error = JsonRpcInternalError.of(sys.exc_info()).to_dict()
+    return error
 
 
 class Endpoint(object):
@@ -116,7 +137,7 @@ class Endpoint(object):
                 self._consumer({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
-                    'error': e.to_dict()
+                    'error': _error_response_dict(e)
                 })
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", message['id'])
@@ -216,7 +237,7 @@ class Endpoint(object):
                 message['result'] = future.result()
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", request_id)
-                message['error'] = e.to_dict()
+                message['error'] = _error_response_dict(e)
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", request_id)
                 message['error'] = JsonRpcInternalError.of(sys.exc_info()).to_dict()

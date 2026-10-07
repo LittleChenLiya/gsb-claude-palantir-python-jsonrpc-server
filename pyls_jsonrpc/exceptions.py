@@ -1,10 +1,15 @@
 # Copyright 2018 Palantir Technologies, Inc.
 import traceback
 
+# Sentinel marking that no ``data`` was supplied, so that an omitted ``data``
+# member stays distinguishable from an explicit JSON ``null`` (``data=None``)
+# when errors are serialized and parsed back.
+DATA_MISSING = object()
+
 
 class JsonRpcException(Exception):
 
-    def __init__(self, message=None, code=None, data=None):
+    def __init__(self, message=None, code=None, data=DATA_MISSING):
         super(JsonRpcException, self).__init__(message)
         self.message = message or getattr(self.__class__, 'MESSAGE')
         self.code = code or getattr(self.__class__, 'CODE')
@@ -15,7 +20,7 @@ class JsonRpcException(Exception):
             'code': self.code,
             'message': self.message,
         }
-        if self.data is not None:
+        if self.data is not DATA_MISSING:
             exception_dict['data'] = self.data
         return exception_dict
 
@@ -86,7 +91,7 @@ class JsonRpcRequestCancelled(JsonRpcException):
 
 class JsonRpcServerError(JsonRpcException):
 
-    def __init__(self, message, code, data=None):
+    def __init__(self, message, code, data=DATA_MISSING):
         assert _is_server_error_code(code)
         super(JsonRpcServerError, self).__init__(message=message, code=code, data=data)
 
