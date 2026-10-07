@@ -4,7 +4,10 @@ import uuid
 import sys
 
 from concurrent import futures
-from .exceptions import JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError, JsonRpcMethodNotFound
+from .exceptions import (
+    JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError, JsonRpcMethodNotFound,
+    is_json_serializable,
+)
 
 log = logging.getLogger(__name__)
 JSONRPC_VERSION = '2.0'
@@ -116,7 +119,7 @@ class Endpoint(object):
                 self._consumer({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
-                    'error': e.to_dict()
+                    'error': self._error_dict(e)
                 })
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", message['id'])
@@ -216,7 +219,7 @@ class Endpoint(object):
                 message['result'] = future.result()
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", request_id)
-                message['error'] = e.to_dict()
+                message['error'] = self._error_dict(e)
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", request_id)
                 message['error'] = JsonRpcInternalError.of(sys.exc_info()).to_dict()
@@ -224,6 +227,23 @@ class Endpoint(object):
             self._consumer(message)
 
         return callback
+
+    @staticmethod
+    def _error_dict(exc):
+        """Serialize an exception to a JSON RPC error dict.
+
+        Only JSON serializable error data is sent on the wire; if the error
+        (typically its ``data`` member) cannot be serialized, fall back to the
+        existing internal error format so the sending thread never crashes.
+
+        Must be called from within an ``except`` block so the fallback can
+        capture the active exception via :func:`sys.exc_info`.
+        """
+        error = exc.to_dict()
+        if is_json_serializable(error):
+            return error
+        log.warning("Error data is not JSON serializable, falling back to internal error format")
+        return JsonRpcInternalError.of(sys.exc_info()).to_dict()
 
     def _handle_response(self, msg_id, result=None, error=None):
         """Handle a response from the client."""

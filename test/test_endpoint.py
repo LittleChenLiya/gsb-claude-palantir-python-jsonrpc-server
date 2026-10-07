@@ -1,6 +1,7 @@
 # Copyright 2018 Palantir Technologies, Inc.
 # pylint: disable=redefined-outer-name
 from concurrent import futures
+import json
 import time
 import mock
 import pytest
@@ -316,6 +317,104 @@ def test_consume_request_cancel_unknown(endpoint):
         'method': '$/cancelRequest',
         'params': {'id': 'unknown identifier'}
     })
+
+
+def test_consume_request_error_structured_data(endpoint, consumer, dispatcher):
+    data = {'reason': 'bad params', 'details': [1, 'two']}
+    handler = mock.Mock(side_effect=exceptions.JsonRpcInvalidParams(data=data))
+    dispatcher['methodName'] = handler
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+
+    consumer.assert_called_once_with({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'error': {
+            'code': exceptions.JsonRpcInvalidParams.CODE,
+            'message': exceptions.JsonRpcInvalidParams.MESSAGE,
+            'data': data,
+        }
+    })
+
+
+def test_consume_request_error_explicit_null_data(endpoint, consumer, dispatcher):
+    handler = mock.Mock(side_effect=exceptions.JsonRpcInvalidParams(data=None))
+    dispatcher['methodName'] = handler
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+
+    _name, args, _kwargs = consumer.mock_calls[0]
+    assert 'data' in args[0]['error']
+    assert args[0]['error']['data'] is None
+
+
+def test_consume_request_error_unset_data(endpoint, consumer, dispatcher):
+    handler = mock.Mock(side_effect=exceptions.JsonRpcInvalidParams())
+    dispatcher['methodName'] = handler
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+
+    _name, args, _kwargs = consumer.mock_calls[0]
+    assert 'data' not in args[0]['error']
+
+
+def test_consume_request_error_unserializable_data(endpoint, consumer, dispatcher):
+    # A non JSON-serializable data member falls back to the internal error
+    # format instead of crashing the consuming thread.
+    handler = mock.Mock(side_effect=exceptions.JsonRpcInvalidParams(data=object()))
+    dispatcher['methodName'] = handler
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+
+    assert_internal_error_fallback(consumer)
+
+
+def test_consume_async_request_error_unserializable_data(endpoint, consumer, dispatcher):
+    # The fallback must also hold on the executor thread sending async results.
+    def _async_handler():
+        raise exceptions.JsonRpcInvalidParams(data={'bad': set([1, 2])})
+    handler = mock.Mock(return_value=_async_handler)
+    dispatcher['methodName'] = handler
+
+    endpoint.consume({
+        'jsonrpc': '2.0',
+        'id': MSG_ID,
+        'method': 'methodName',
+        'params': {'key': 'value'}
+    })
+
+    await_assertion(lambda: assert_internal_error_fallback(consumer))
+
+
+def assert_internal_error_fallback(consumer_mock):
+    """Assert the consumer received exactly one error in the internal error format."""
+    assert len(consumer_mock.mock_calls) == 1
+    _name, args, _kwargs = consumer_mock.mock_calls[0]
+    error = args[0]['error']
+    assert error['code'] == exceptions.JsonRpcInternalError.CODE
+    assert 'traceback' in error['data']
+    # The fallback error itself must be JSON serializable
+    json.dumps(error)
 
 
 def assert_consumer_error(consumer_mock, exception):

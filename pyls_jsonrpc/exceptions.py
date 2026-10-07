@@ -1,10 +1,46 @@
 # Copyright 2018 Palantir Technologies, Inc.
+import json
 import traceback
+
+
+class _UnsetType(object):
+    """Sentinel type marking that no error ``data`` member was provided.
+
+    This is distinct from ``None`` so that an explicit ``data=None``
+    (JSON ``null``) round-trips differently from an absent ``data`` member.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(_UnsetType, cls).__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'DATA_UNSET'
+
+    def __bool__(self):
+        return False
+
+    __nonzero__ = __bool__
+
+
+DATA_UNSET = _UnsetType()
+
+
+def is_json_serializable(value):
+    """Return True if the value can be serialized to JSON."""
+    try:
+        json.dumps(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 class JsonRpcException(Exception):
 
-    def __init__(self, message=None, code=None, data=None):
+    def __init__(self, message=None, code=None, data=DATA_UNSET):
         super(JsonRpcException, self).__init__(message)
         self.message = message or getattr(self.__class__, 'MESSAGE')
         self.code = code or getattr(self.__class__, 'CODE')
@@ -15,7 +51,7 @@ class JsonRpcException(Exception):
             'code': self.code,
             'message': self.message,
         }
-        if self.data is not None:
+        if self.data is not DATA_UNSET:
             exception_dict['data'] = self.data
         return exception_dict
 
@@ -86,7 +122,7 @@ class JsonRpcRequestCancelled(JsonRpcException):
 
 class JsonRpcServerError(JsonRpcException):
 
-    def __init__(self, message, code, data=None):
+    def __init__(self, message, code, data=DATA_UNSET):
         assert _is_server_error_code(code)
         super(JsonRpcServerError, self).__init__(message=message, code=code, data=data)
 
