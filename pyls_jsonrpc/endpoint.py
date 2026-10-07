@@ -2,9 +2,16 @@
 import logging
 import uuid
 import sys
+import threading
 
 from concurrent import futures
-from .exceptions import JsonRpcException, JsonRpcRequestCancelled, JsonRpcInternalError, JsonRpcMethodNotFound
+from .exceptions import (
+    JsonRpcException,
+    JsonRpcRequestCancelled,
+    JsonRpcEndpointClosed,
+    JsonRpcInternalError,
+    JsonRpcMethodNotFound,
+)
 
 log = logging.getLogger(__name__)
 JSONRPC_VERSION = '2.0'
@@ -33,8 +40,54 @@ class Endpoint(object):
         self._server_request_futures = {}
         self._executor_service = futures.ThreadPoolExecutor(max_workers=max_workers)
 
+        self._closed = False
+        self._write_lock = threading.Lock()
+
     def shutdown(self):
+        """Shut down the endpoint's own asynchronous executor pool.
+
+        This only drains the internal service used to run callable notification/request
+        handlers. It does not cancel request handlers that were supplied as an external
+        :class:`~concurrent.futures.Future`.
+        """
         self._executor_service.shutdown()
+
+    def close(self):
+        """Explicitly close the endpoint's RPC channel.
+
+        All locally pending requests (requests this endpoint made and is still awaiting a
+        response for) are completed with a :class:`JsonRpcEndpointClosed` exception. Once
+        closed, no new message may be written to the consumer, and any response that
+        arrives late is ignored rather than re-completing an already settled future.
+
+        Calling this method more than once is safe. External executors and request handler
+        futures created by the caller are never cancelled.
+        """
+        with self._write_lock:
+            if self._closed:
+                log.debug('Endpoint already closed, ignoring redundant close()')
+                return
+            self._closed = True
+            # Snapshot and clear the pending requests while holding the lock so that a
+            # concurrent late response can no longer observe these futures.
+            pending_futures = self._server_request_futures
+            self._server_request_futures = {}
+
+        log.debug('Closing endpoint, failing %s pending request(s)', len(pending_futures))
+        for msg_id, request_future in pending_futures.items():
+            if not request_future.done():
+                request_future.set_exception(JsonRpcEndpointClosed())
+            else:
+                log.debug('Pending request %s was already completed, leaving it untouched', msg_id)
+
+    def _write(self, message):
+        """Write a message to the consumer unless the endpoint has been closed."""
+        with self._write_lock:
+            if self._closed:
+                log.debug('Endpoint is closed, dropping outgoing message %s', message)
+                return False
+            self._consumer(message)
+            return True
 
     def notify(self, method, params=None):
         """Send a JSON RPC notification to the client.
@@ -52,7 +105,7 @@ class Endpoint(object):
         if params is not None:
             message['params'] = params
 
-        self._consumer(message)
+        self._write(message)
 
     def request(self, method, params=None):
         """Send a JSON RPC request to the client.
@@ -62,7 +115,10 @@ class Endpoint(object):
             params (any): The payload of the message
 
         Returns:
-            Future that will resolve once a response has been received
+            Future that will resolve once a response has been received. If the endpoint
+            has been closed, an already failed future carrying a
+            :class:`JsonRpcEndpointClosed` exception is returned and nothing is written
+            to the consumer.
         """
         msg_id = self._id_generator()
         log.debug('Sending request with id %s: %s %s', msg_id, method, params)
@@ -78,8 +134,13 @@ class Endpoint(object):
         request_future = futures.Future()
         request_future.add_done_callback(self._cancel_callback(msg_id))
 
-        self._server_request_futures[msg_id] = request_future
-        self._consumer(message)
+        with self._write_lock:
+            if self._closed:
+                # Do not register the future or write to the consumer once closed.
+                request_future.set_exception(JsonRpcEndpointClosed())
+                return request_future
+            self._server_request_futures[msg_id] = request_future
+            self._consumer(message)
 
         return request_future
 
@@ -97,6 +158,10 @@ class Endpoint(object):
         Args:
             message (dict): The JSON RPC message sent by the client
         """
+        if self._closed:
+            log.debug('Endpoint is closed, ignoring incoming message %s', message)
+            return
+
         if 'jsonrpc' not in message or message['jsonrpc'] != JSONRPC_VERSION:
             log.warning("Unknown message type %s", message)
             return
@@ -113,14 +178,14 @@ class Endpoint(object):
                 self._handle_request(message['id'], message['method'], message.get('params'))
             except JsonRpcException as e:
                 log.exception("Failed to handle request %s", message['id'])
-                self._consumer({
+                self._write({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
                     'error': e.to_dict()
                 })
             except Exception:  # pylint: disable=broad-except
                 log.exception("Failed to handle request %s", message['id'])
-                self._consumer({
+                self._write({
                     'jsonrpc': JSONRPC_VERSION,
                     'id': message['id'],
                     'error': JsonRpcInternalError.of(sys.exc_info()).to_dict()
@@ -192,7 +257,7 @@ class Endpoint(object):
             handler_result.add_done_callback(self._request_callback(msg_id))
         else:
             log.debug("Got result from synchronous request handler: %s", handler_result)
-            self._consumer({
+            self._write({
                 'jsonrpc': JSONRPC_VERSION,
                 'id': msg_id,
                 'result': handler_result
@@ -221,7 +286,7 @@ class Endpoint(object):
                 log.exception("Failed to handle request %s", request_id)
                 message['error'] = JsonRpcInternalError.of(sys.exc_info()).to_dict()
 
-            self._consumer(message)
+            self._write(message)
 
         return callback
 

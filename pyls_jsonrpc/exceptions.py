@@ -84,6 +84,11 @@ class JsonRpcRequestCancelled(JsonRpcException):
     MESSAGE = 'Request Cancelled'
 
 
+class JsonRpcEndpointClosed(JsonRpcException):
+    CODE = -32000
+    MESSAGE = 'Endpoint Closed'
+
+
 class JsonRpcServerError(JsonRpcException):
 
     def __init__(self, message, code, data=None):
@@ -106,5 +111,6 @@ _EXCEPTIONS = (
     JsonRpcInvalidParams,
     JsonRpcInternalError,
     JsonRpcRequestCancelled,
+    JsonRpcEndpointClosed,
     JsonRpcServerError,
 )
